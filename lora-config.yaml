@@ -1,0 +1,11 @@
+# LoRA fine-tuning config for Qwen3-4B on MacBook
+num_layers: 16
+learning_rate: 1.0e-5
+batch_size: 1
+iters: 800
+val_batches: 5
+steps_per_report: 10
+steps_per_eval: 50
+save_every: 50
+adapter_path: "adapters"
+grad_checkpoint: true

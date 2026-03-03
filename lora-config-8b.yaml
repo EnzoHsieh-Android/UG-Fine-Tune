@@ -1,0 +1,40 @@
+# LoRA fine-tuning config for Qwen3-8B on MacBook (Apple Silicon)
+# Base model: Qwen3-8B-4bit
+# Round 26: added mask-prompt, adamw, iters 800, explicit lora rank 16
+#
+# Usage: .venv/bin/python3 -m mlx_lm.lora -c lora-config-8b.yaml
+
+# Model
+model: "model/Qwen3-8B-4bit"
+data: "data"
+train: true
+
+# Model architecture
+num_layers: 24          # 8B model has 36 layers, fine-tune top 24
+
+# LoRA parameters
+lora_parameters:
+  rank: 16              # Good balance of capacity vs overfitting
+  dropout: 0.0
+  scale: 20.0
+
+# Training hyperparameters
+learning_rate: 5.0e-6   # Lower LR for stability
+batch_size: 1           # Memory constrained on 32GB MacBook
+grad_accumulation_steps: 4  # Round 28: effective batch size = 4, zero memory cost
+iters: 1400             # Round 32: ~0.73 epochs with 1927 train samples (was 900 for 1141)
+optimizer: "adamw"      # Round 26: weight decay for regularization
+mask_prompt: true       # Round 26: only compute loss on assistant responses
+max_seq_length: 2048    # Data max ~1944 chars, 2048 is safe
+
+# Evaluation
+val_batches: 5
+steps_per_report: 10
+steps_per_eval: 50      # Val loss every 50 iters
+save_every: 100         # Checkpoint every 100 iters
+
+# Output
+adapter_path: "adapters-8b"
+
+# Memory optimization
+grad_checkpoint: true   # Required for 8B on 32GB Mac

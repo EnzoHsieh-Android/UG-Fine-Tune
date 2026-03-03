@@ -1,0 +1,34 @@
+# Models (too large for git)
+model/
+
+# Adapters (generated from training)
+adapters/
+adapters-8b/
+adapters-8b-q8/
+adapters-8b-r26/
+adapters-runpod/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Secrets
+.env
+.telegram_config
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+runpod_training.log
+
+# Large generated files
+calibration_data.json
+
+# Temporary audit reports
+AUDIT_REPORT.md
+AUDIT_SUMMARY.txt
+ISSUES_BY_LINE.txt
