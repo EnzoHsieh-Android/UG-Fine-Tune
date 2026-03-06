@@ -23,13 +23,15 @@ GPU_TYPE="NVIDIA A40"
 IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 TEMPLATE_ID="runpod-torch-v240"
 POD_NAME="ug-finetune-$(date +%m%d%H%M)"
-VOLUME_GB=50
-DISK_GB=50
+VOLUME_GB=60
+DISK_GB=100
 MAX_STEPS=1000
 SAVE_STEPS=100
 SKIP_DELETE=false
 EVAL_ONLY=false
 EXISTING_POD_ID=""
+MODEL_NAME=""
+FP16_FLAG=""
 
 # 解析參數
 while [[ $# -gt 0 ]]; do
@@ -40,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --eval-only)   EVAL_ONLY=true; shift ;;
         --pod-id)      EXISTING_POD_ID="$2"; shift 2 ;;
         --gpu)         GPU_TYPE="$2"; shift 2 ;;
+        --model)       MODEL_NAME="$2"; shift 2 ;;
+        --fp16)        FP16_FLAG="--fp16"; shift ;;
         *)             echo "未知參數: $1"; exit 1 ;;
     esac
 done
@@ -59,7 +63,8 @@ if ! [[ "$SAVE_STEPS" =~ ^[0-9]+$ ]]; then
 fi
 
 # INTENTIONAL: 使用 StrictHostKeyChecking=no — RunPod pod 為臨時性機器，每次 IP 不同
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+# ServerAliveInterval: 每 30 秒發 keepalive，避免閒置斷線
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=120"
 
 # ==================== Helper Functions ====================
 
@@ -156,6 +161,8 @@ echo "================================================"
 echo "RunPod 雲端 LoRA 訓練部署"
 echo "================================================"
 echo "  GPU: $GPU_TYPE"
+echo "  Model: ${MODEL_NAME:-Qwen/Qwen3.5-9B (default)}"
+echo "  Precision: ${FP16_FLAG:+FP16 全精度}${FP16_FLAG:-8-bit QLoRA}"
 echo "  Max steps: $MAX_STEPS"
 echo "  Save every: $SAVE_STEPS steps"
 echo "  Eval only: $EVAL_ONLY"
@@ -222,40 +229,116 @@ echo ""
 echo "=== Step 4: 執行訓練 ==="
 echo "  開始時間: $(date)"
 
-TRAIN_ARGS="--max-steps $MAX_STEPS --save-steps $SAVE_STEPS"
+TRAIN_ARGS="--train-only --max-steps $MAX_STEPS --save-steps $SAVE_STEPS"
+[ -n "$MODEL_NAME" ] && TRAIN_ARGS="$TRAIN_ARGS --model $MODEL_NAME"
+[ -n "$FP16_FLAG" ] && TRAIN_ARGS="$TRAIN_ARGS --fp16"
 if [ "$EVAL_ONLY" = true ]; then
     TRAIN_ARGS="--eval-only"
+    [ -n "$MODEL_NAME" ] && TRAIN_ARGS="$TRAIN_ARGS --model $MODEL_NAME"
+    [ -n "$FP16_FLAG" ] && TRAIN_ARGS="$TRAIN_ARGS --fp16"
 fi
 
-# 使用 unbuffered output 確保即時顯示
-ssh $SSH_OPTS -p "$SSH_PORT" "root@$SSH_IP" \
-    "cd /workspace && PYTHONUNBUFFERED=1 python3 cloud_train_runpod.py $TRAIN_ARGS" \
-    2>&1 | tee "$SCRIPT_DIR/runpod_training.log"
+# Foreground SSH + keepalive + 自動重連（SSH 斷線後 resume from checkpoint）
+MAX_SSH_RETRIES=5
+for SSH_RETRY in $(seq 1 $MAX_SSH_RETRIES); do
+    echo "  [嘗試 $SSH_RETRY/$MAX_SSH_RETRIES]"
+    set +e  # 暫時關閉 errexit，避免 SSH exit 255 直接終止腳本
+    ssh $SSH_OPTS -p "$SSH_PORT" "root@$SSH_IP" \
+        "cd /workspace && PYTHONUNBUFFERED=1 python3 cloud_train_runpod.py $TRAIN_ARGS" \
+        2>&1 | tee -a "$SCRIPT_DIR/runpod_training.log"
+    SSH_EXIT=${PIPESTATUS[0]}  # 取 ssh 的 exit code，非 tee 的
+    set -e
+
+    if [ $SSH_EXIT -eq 0 ]; then
+        echo "  完成"
+        break
+    fi
+
+    if [ $SSH_EXIT -eq 255 ] && [ $SSH_RETRY -lt $MAX_SSH_RETRIES ]; then
+        echo ""
+        echo "  ⚠ SSH 斷線 (exit 255)，等待 60 秒後重連..."
+        echo "  （訓練腳本會自動從最新 checkpoint 恢復）"
+        sleep 60
+        # 確認 pod 還活著
+        POD_STATUS=$(get_ssh_info "$POD_ID" | cut -d'|' -f1)
+        if [ "$POD_STATUS" != "RUNNING" ]; then
+            echo "  Pod 已停止 (status=$POD_STATUS)，無法重連"
+            exit 1
+        fi
+        # 重新取得 SSH 資訊（port 可能變）
+        wait_for_pod "$POD_ID"
+        wait_for_ssh
+        continue
+    fi
+
+    echo "  訓練失敗 (exit $SSH_EXIT)"
+    exit $SSH_EXIT
+done
 
 echo "  完成時間: $(date)"
 
-# ==================== Step 5: 下載結果 ====================
+# ==================== Step 5: 下載 Checkpoint ====================
 
 echo ""
-echo "=== Step 5: 下載結果 ==="
+echo "=== Step 5: 下載所有 checkpoint adapter ==="
 
 mkdir -p "$SCRIPT_DIR/adapters-runpod"
 
-# 下載 eval 結果
-echo "  下載 eval_results.json..."
+if [ "$EVAL_ONLY" != true ]; then
+    # 列出遠端 checkpoint 目錄
+    CHECKPOINTS=$(ssh $SSH_OPTS -p "$SSH_PORT" "root@$SSH_IP" \
+        "ls -d /workspace/adapters-runpod/checkpoint-* 2>/dev/null | sort -t- -k2 -n" 2>/dev/null) || true
+
+    if [ -n "$CHECKPOINTS" ]; then
+        CP_COUNT=$(echo "$CHECKPOINTS" | wc -l | tr -d ' ')
+        echo "  找到 $CP_COUNT 個 checkpoint，開始下載..."
+        for CP_PATH in $CHECKPOINTS; do
+            CP_NAME=$(basename "$CP_PATH")
+            echo "  下載 $CP_NAME..."
+            mkdir -p "$SCRIPT_DIR/adapters-runpod/$CP_NAME"
+            scp $SSH_OPTS -P "$SSH_PORT" \
+                "root@$SSH_IP:$CP_PATH/adapter_model.safetensors" \
+                "root@$SSH_IP:$CP_PATH/adapter_config.json" \
+                "$SCRIPT_DIR/adapters-runpod/$CP_NAME/" 2>/dev/null || echo "    ($CP_NAME 下載失敗)"
+        done
+        echo "  所有 checkpoint 已下載到 $SCRIPT_DIR/adapters-runpod/"
+    else
+        echo "  (未找到 checkpoint)"
+    fi
+fi
+
+# ==================== Step 6: 遠端評估 ====================
+
+if [ "$EVAL_ONLY" != true ]; then
+    echo ""
+    echo "=== Step 6: 在 Pod 上執行評估 ==="
+
+    set +e
+    ssh $SSH_OPTS -p "$SSH_PORT" "root@$SSH_IP" \
+        "cd /workspace && PYTHONUNBUFFERED=1 python3 cloud_train_runpod.py --eval-only${MODEL_NAME:+ --model $MODEL_NAME}${FP16_FLAG:+ $FP16_FLAG}" \
+        2>&1 | tee -a "$SCRIPT_DIR/runpod_training.log"
+    EVAL_EXIT=${PIPESTATUS[0]}
+    set -e
+
+    if [ $EVAL_EXIT -ne 0 ]; then
+        echo "  ⚠ 評估失敗 (exit $EVAL_EXIT)，但 checkpoint 已下載到本地"
+    fi
+fi
+
+# 下載 eval 結果和 best adapter
+echo ""
+echo "  下載評估結果..."
 scp $SSH_OPTS -P "$SSH_PORT" \
     "root@$SSH_IP:/workspace/adapters-runpod/eval_results.json" \
     "$SCRIPT_DIR/adapters-runpod/" 2>/dev/null || echo "  (eval_results.json 未找到)"
 
-# 下載最佳 adapter
-echo "  下載 best/ adapter..."
 scp -r $SSH_OPTS -P "$SSH_PORT" \
     "root@$SSH_IP:/workspace/adapters-runpod/best/" \
     "$SCRIPT_DIR/adapters-runpod/best/" 2>/dev/null || echo "  (best/ 未找到)"
 
 echo "  下載完成"
 
-# ==================== Step 6: 刪除 Pod ====================
+# ==================== Step 7: 刪除 Pod ====================
 
 if [ "$SKIP_DELETE" = true ]; then
     echo ""
@@ -265,7 +348,7 @@ if [ "$SKIP_DELETE" = true ]; then
     echo "  ⚠ 費用持續計算！用完請手動刪除"
 else
     echo ""
-    echo "=== Step 6: 刪除 Pod ==="
+    echo "=== Step 7: 刪除 Pod ==="
     gql "mutation { podTerminate(input: {podId: \"$POD_ID\"}) }" > /dev/null
     echo "  Pod $POD_ID 已刪除"
 fi
@@ -284,29 +367,17 @@ if [ -f "$SCRIPT_DIR/adapters-runpod/eval_results.json" ]; then
 fi
 
 echo ""
-echo "後續步驟："
-echo "  1. PEFT merge（合併 adapter 到基座模型）"
-echo "     cd $SCRIPT_DIR"
-echo "     source .venv/bin/activate"
-echo "     python3 -c \""
-echo "       from peft import PeftModel"
-echo "       from transformers import AutoModelForCausalLM, AutoTokenizer"
-echo "       base = AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-8B', torch_dtype='auto')"
-echo "       model = PeftModel.from_pretrained(base, 'adapters-runpod/best')"
-echo "       merged = model.merge_and_unload()"
-echo "       merged.save_pretrained('model/Qwen3-8B-UG-order-v11')"
-echo "       AutoTokenizer.from_pretrained('Qwen/Qwen3-8B').save_pretrained('model/Qwen3-8B-UG-order-v11')"
-echo "     \""
+echo "後續步驟（Qwen3.5-9B 不 merge，直接用 adapter）："
+echo "  1. 上傳 adapter 到 GCP"
+echo "     gsutil -m cp -r adapters-runpod/best/ gs://ug-llm-models/adapter-qwen35-rXX/"
 echo ""
-echo "  2. 修復 config.json（補 rope_theta + max_position_embeddings）"
+echo "  2. VM 上下載"
+echo "     gsutil -m cp -r gs://ug-llm-models/adapter-qwen35-rXX/ /opt/models/"
 echo ""
-echo "  3. MLX 量化"
-echo "     .venv/bin/python3 -m mlx_lm.convert \\"
-echo "       --hf-path model/Qwen3-8B-UG-order-v11 \\"
-echo "       --mlx-path model/Qwen3-8B-UG-order-v11-8bit \\"
-echo "       --quantize --q-bits 8"
+echo "  3. 啟動 vLLM FP8 + LoRA"
+echo "     sudo bash /opt/scripts/start_vllm_qwen35_fp8.sh"
 echo ""
-echo "  4. 本地測試"
-echo "     更新 llm_server_mlx.py MODEL_PATH → 重啟 → ./test_diversity_v2.sh + ./test_generalization.sh"
+echo "  4. 跑完整測試"
+echo "     bash test_diversity_v2.sh && bash test_generalization.sh"
 echo ""
 echo "訓練日誌: $SCRIPT_DIR/runpod_training.log"

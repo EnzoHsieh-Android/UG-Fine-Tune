@@ -1,0 +1,43 @@
+# LoRA fine-tuning config for Qwen3.5-4B on MacBook (Apple Silicon)
+# Base model: Qwen3.5-4B FP16 (~8.4GB)
+# Architecture: 32 layers (24 DeltaNet + 8 Full Attention, 3:1 ratio)
+#
+# Usage: .venv/bin/python3 -m mlx_lm.lora -c lora-config-qwen35-4b.yaml
+
+# Model
+model: "model/Qwen3.5-4B"
+data: "data"
+train: true
+
+# Model architecture
+# 32 layers total, FP16 on 32GB Mac needs fewer layers
+num_layers: 16
+
+# LoRA parameters
+# Unsloth recommends rank=16, alpha=rank or 2*rank for Qwen3.5
+lora_parameters:
+  rank: 16
+  dropout: 0.05          # Small dropout for regularization (4B overfits easier)
+  scale: 20.0            # Same as 8B config
+
+# Training hyperparameters
+# 4B model: higher LR than 8B since model capacity is lower
+learning_rate: 1.0e-5    # 2x of 8B's 5e-6, still conservative for structured JSON task
+batch_size: 1            # FP16 on 32GB Mac, conservative
+grad_accumulation_steps: 8   # Effective batch size = 8
+iters: 1000              # ~4 epochs with 1950 train samples
+optimizer: "adamw"
+mask_prompt: true        # Only compute loss on assistant responses
+max_seq_length: 2048
+
+# Evaluation
+val_batches: 5
+steps_per_report: 10
+steps_per_eval: 50
+save_every: 100
+
+# Output
+adapter_path: "adapters-qwen35-4b"
+
+# Memory optimization
+grad_checkpoint: true    # Safety margin on 32GB Mac

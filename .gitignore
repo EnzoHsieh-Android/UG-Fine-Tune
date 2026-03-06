@@ -7,6 +7,8 @@ adapters-8b/
 adapters-8b-q8/
 adapters-8b-r26/
 adapters-runpod/
+adapters-runpod-4b/
+adapters-runpod-9b/
 
 # Python
 __pycache__/

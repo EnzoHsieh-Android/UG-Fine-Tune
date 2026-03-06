@@ -26,8 +26,17 @@ def install_deps():
     print("=== 安裝依賴 ===")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
                           stdout=subprocess.DEVNULL)
+    # 先清理舊版 torch 相關包，避免新舊版共存撐爆 disk/RAM
+    print("  清理舊版 PyTorch...")
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y",
+                    "torch", "torchvision", "torchaudio", "triton", "xformers"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("  安裝 unsloth + 依賴...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "unsloth", "bitsandbytes"])
     subprocess.check_call([sys.executable, "-m", "pip", "install", "datasets", "safetensors"])
+    # Qwen3.5 需要最新 transformers（model_type=qwen3_5 尚未在穩定版中）
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                          "git+https://github.com/huggingface/transformers.git"])
     print("安裝完成\n")
 
 
@@ -49,7 +58,7 @@ from peft import set_peft_model_state_dict
 
 # ==================== 配置 ====================
 
-BASE_MODEL = "Qwen/Qwen3-8B"
+BASE_MODEL = "Qwen/Qwen3.5-9B"
 MAX_SEQ_LENGTH = 2048
 OUTPUT_DIR = "adapters-runpod"
 DATA_DIR = "data"
@@ -380,22 +389,26 @@ def simulate_fill_defaults(orders):
 # ==================== 推論 + 評估 ====================
 
 def generate_response(model, tokenizer, user_input):
-    """GPU 推論（替代本地 MLX 的 mlx_lm.generate）。"""
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input},
-    ]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    text += "/no_think\n"
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    """GPU 推論（替代本地 MLX 的 mlx_lm.generate）。
+    手動構造 prompt，繞過 Qwen3.5 VLM tokenizer 的 image processor。
+    使用底層 text tokenizer 避免觸發 VLM processor。
+    """
+    text = (
+        "<|im_start|>system\n" + SYSTEM_PROMPT + "<|im_end|>\n"
+        "<|im_start|>user\n" + user_input + "<|im_end|>\n"
+        "<|im_start|>assistant\n/no_think\n"
+    )
+    # 取得底層 text tokenizer（避免 VLM processor 把文字當圖片處理）
+    text_tok = getattr(tokenizer, 'tokenizer', tokenizer)
+    inputs = text_tok(text, return_tensors="pt").to(model.device)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_new_tokens=512,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=text_tok.eos_token_id,
         )
-    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    response = text_tok.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     response = re.sub(r'<think>.*?</think>\s*', '', response, flags=re.DOTALL)
     return response.strip()
 
@@ -548,17 +561,22 @@ def run_eval(model, tokenizer):
 
 def do_train(args):
     """載入模型 → 配置 LoRA → 訓練。"""
-    print("=== 載入模型 ===")
+    use_8bit = not getattr(args, 'fp16', False)
+    precision_str = "8-bit QLoRA" if use_8bit else "FP16 全精度"
+    print(f"=== 載入模型 ({precision_str}) ===")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=False,
-        load_in_8bit=True,
+        load_in_8bit=use_8bit,
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print("=== 配置 LoRA (rank=32, alpha=64, all 36 layers) ===")
+    # Qwen3.5-9B: 32 layers (24 DeltaNet + 8 Full Attention)
+    # 方案 A: LoRA 只作用於 Full Attention (8層) + MLP (32層)
+    # DeltaNet 層的 in_proj_qkv/in_proj_z 等用不同名稱，不會被命中
+    print("=== 配置 LoRA (rank=32, alpha=64, all 32 layers MLP + 8 attn layers) ===")
     model = FastLanguageModel.get_peft_model(
         model,
         r=32,
@@ -582,10 +600,13 @@ def do_train(args):
     print(f"  train: {len(dataset['train'])} 筆, validation: {len(dataset['validation'])} 筆")
 
     def formatting_func(examples):
-        texts = [
-            tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=False)
-            for convo in examples["messages"]
-        ]
+        """手動構造 chat format，繞過 Qwen3.5 VLM tokenizer 的 image processor。"""
+        texts = []
+        for convo in examples["messages"]:
+            parts = []
+            for msg in convo:
+                parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n")
+            texts.append("".join(parts))
         return {"text": texts}
 
     dataset = dataset.map(formatting_func, batched=True, num_proc=2)
@@ -645,8 +666,19 @@ def do_train(args):
     else:
         print("  WARNING: mask_prompt disabled — loss 會計算在 prompt tokens 上")
 
-    print("\n=== 開始訓練 ===")
-    trainer.train()
+    # 檢查是否有已存在的 checkpoint（SSH 斷線後重連 resume 用）
+    existing_checkpoints = sorted(
+        glob.glob(f"{OUTPUT_DIR}/checkpoint-*"),
+        key=lambda x: int(os.path.basename(x).split("-")[-1])
+    )
+    if existing_checkpoints:
+        last_cp = existing_checkpoints[-1]
+        last_step = int(os.path.basename(last_cp).split("-")[-1])
+        print(f"\n=== 從 checkpoint-{last_step} 恢復訓練 ===")
+        trainer.train(resume_from_checkpoint=last_cp)
+    else:
+        print("\n=== 開始訓練 ===")
+        trainer.train()
     print("訓練完成\n")
 
     return model, tokenizer
@@ -773,7 +805,15 @@ def main():
     parser.add_argument("--max-steps", type=int, default=1000, help="最大訓練步數 (default: 1000)")
     parser.add_argument("--save-steps", type=int, default=100, help="Checkpoint 儲存間隔 (default: 100)")
     parser.add_argument("--eval-only", action="store_true", help="只跑評估，不訓練")
+    parser.add_argument("--train-only", action="store_true", help="只跑訓練，不評估（先下載再評估）")
+    parser.add_argument("--model", type=str, default=None, help="HuggingFace 模型名稱 (覆蓋 BASE_MODEL)")
+    parser.add_argument("--fp16", action="store_true", help="全精度 FP16 訓練（不量化）")
     args = parser.parse_args()
+
+    # 允許命令列覆蓋模型
+    global BASE_MODEL
+    if args.model:
+        BASE_MODEL = args.model
 
     print(f"RunPod 雲端 LoRA 訓練腳本")
     print(f"  Model: {BASE_MODEL}")
@@ -784,12 +824,14 @@ def main():
     print()
 
     if args.eval_only:
-        print("=== Eval-only mode ===")
+        use_8bit = not getattr(args, 'fp16', False)
+        precision_str = "8-bit" if use_8bit else "FP16"
+        print(f"=== Eval-only mode ({precision_str}) ===")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=BASE_MODEL,
             max_seq_length=MAX_SEQ_LENGTH,
             load_in_4bit=False,
-        load_in_8bit=True,
+            load_in_8bit=use_8bit,
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -806,6 +848,10 @@ def main():
             max_seq_length=MAX_SEQ_LENGTH,
         )
         evaluate_checkpoints(model, tokenizer)
+    elif args.train_only:
+        print("=== Train-only mode（訓練完不評估，先下載 checkpoint）===")
+        model, tokenizer = do_train(args)
+        print("\n訓練完成！Checkpoint 已儲存，請先下載再跑 --eval-only")
     else:
         model, tokenizer = do_train(args)
         evaluate_checkpoints(model, tokenizer)
