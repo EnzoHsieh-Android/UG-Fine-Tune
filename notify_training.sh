@@ -1,8 +1,20 @@
 #!/bin/bash
 # Monitor training output and send Telegram notifications for progress + completion
-BOT_TOKEN="7635280352:AAGJhdamXlN9aCeqSYhXDP5cBX04xfB3tiU"
-CHAT_ID="7820341839"
-OUTPUT_FILE="/private/tmp/claude-501/-Users-xiechengru/tasks/b139ea9.output"
+# 設定:與 notify_telegram.py 共用同目錄的 .telegram_config(已列入 .gitignore),內容兩行:
+#   BOT_TOKEN=your_bot_token
+#   CHAT_ID=your_chat_id
+# 也可直接用同名環境變數覆蓋。
+# 用法: ./notify_training.sh <訓練輸出檔路徑>
+CONFIG_PATH="$(cd "$(dirname "$0")" && pwd)/.telegram_config"
+if [ -f "$CONFIG_PATH" ]; then
+    : "${BOT_TOKEN:=$(grep '^BOT_TOKEN=' "$CONFIG_PATH" | head -1 | cut -d= -f2-)}"
+    : "${CHAT_ID:=$(grep '^CHAT_ID=' "$CONFIG_PATH" | head -1 | cut -d= -f2-)}"
+fi
+if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+    echo "缺少 BOT_TOKEN 或 CHAT_ID:請建立 $CONFIG_PATH 或設定環境變數" >&2
+    exit 1
+fi
+OUTPUT_FILE="${1:?用法: $0 <訓練輸出檔路徑>}"
 
 send_msg() {
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
